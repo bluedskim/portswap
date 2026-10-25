@@ -17,7 +17,8 @@
 
 ```sh
 go build -o portswap .
-go build -o examples/demoapp/demoapp ./examples/demoapp   # 시연용 앱
+go build -o examples/demoapp/demoapp ./examples/demoapp   # 시연용 Go 앱
+./examples/javademo/build.sh                               # 시연용 Java 앱 (JDK 필요)
 ```
 
 # 사용법
@@ -90,6 +91,66 @@ services:
 curl 127.0.0.1:9000/            # pid=... version=v1
 ./portswap deploy               # 새 pid 로 전환, 옛 pid 종료
 curl 127.0.0.1:9000/            # pid 가 바뀌어 있음
+```
+
+# Java 앱
+
+Spring Boot·일반 JAR 은 보통 `PORT` 환경변수나 `-Dserver.port` 로 포트를 받는다. portswap 은 자식 프로세스에 `PORT` 를 넣어 주므로, 앱이 그 값으로 **127.0.0.1** 에 리슨하면 된다. 인자로 포트를 못 받을 때는 셸로 감싼다.
+
+## 단일 서비스 (CLI)
+
+```sh
+./examples/javademo/build.sh
+
+./portswap serve --listen 127.0.0.1:8080 \
+  --health 'http://127.0.0.1:{port}/health' \
+  --control /tmp/portswap.sock \
+  -- sh -c 'exec java -Dserver.port=$PORT -jar /opt/app/app.jar'
+# Spring Boot 가 server.port 만 쓰는 경우 위와 같다. 시연용 클래스는 아래처럼 -cp 로 기동할 수 있다.
+# -- sh -c 'exec java -Dapp.version=v1 -cp examples/javademo/classes HttpDemo'
+
+curl 127.0.0.1:8080/
+# JAR 을 새로 빌드·복사한 뒤 같은 serve 프로세스에 배포
+./portswap deploy --control /tmp/portswap.sock
+```
+
+시연용 `examples/javademo/HttpDemo.java` 는 JDK 표준 `HttpServer` 만 쓴다. `PORT` 와 `/health` 를 지원한다.
+
+```sh
+PORT=18080 java -cp examples/javademo/classes HttpDemo &
+curl 127.0.0.1:18080/health
+```
+
+## 여러 서비스 (Go + Java)
+
+`examples/portswap-multiservice.yaml` 은 `web`(Go demoapp)과 `api`(Java)를 함께 올리는 예다.
+
+```sh
+go build -o examples/demoapp/demoapp ./examples/demoapp
+./examples/javademo/build.sh
+./portswap serve --config examples/portswap-multiservice.yaml &
+
+curl 127.0.0.1:9000/    # Go
+curl 127.0.0.1:9001/    # Java api
+
+# Java 서비스만 무중단 교체 (JAR·클래스 갱신 후)
+APP_VERSION=v2 ./portswap deploy --control /tmp/portswap.sock --service api
+curl 127.0.0.1:9001/
+
+# Go 서비스만 교체
+./portswap deploy --control /tmp/portswap.sock --service web
+```
+
+운영 JAR 배포 시 `api` 서비스의 `command` 는 예를 들어 다음과 같이 두면 된다.
+
+```yaml
+  api:
+    listen: ":8081"
+    health: "http://127.0.0.1:{port}/actuator/health"   # Spring Boot
+    command:
+      - sh
+      - -c
+      - 'exec java -Dserver.port=$PORT -jar /opt/api/app.jar'
 ```
 
 # 한계
