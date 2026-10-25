@@ -11,6 +11,7 @@ import (
 
 	"portswap/internal/forwarder"
 	"portswap/internal/manager"
+	"portswap/internal/registry"
 )
 
 func TestStatusAndDeployOverUnixSocket(t *testing.T) {
@@ -32,8 +33,12 @@ func TestStatusAndDeployOverUnixSocket(t *testing.T) {
 	}, fwd)
 	defer mgr.Shutdown(context.Background())
 
+	reg := registry.New(log.New(io.Discard, "", 0))
+	if err := reg.Add("default", mgr, fwd); err != nil {
+		t.Fatal(err)
+	}
 	sock := filepath.Join(t.TempDir(), "ctl.sock")
-	srv := NewServer(mgr, sock)
+	srv := NewServer(reg, sock)
 	go srv.ListenAndServe(ctx)
 	for i := 0; i < 50; i++ {
 		if _, err := os.Stat(sock); err == nil {
@@ -43,7 +48,7 @@ func TestStatusAndDeployOverUnixSocket(t *testing.T) {
 	}
 
 	cl := NewClient(sock)
-	st, err := cl.Status(ctx)
+	st, err := cl.Status(ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +56,7 @@ func TestStatusAndDeployOverUnixSocket(t *testing.T) {
 		t.Fatalf("unexpected initial status %+v", st)
 	}
 
-	res, err := cl.Deploy(ctx)
+	res, err := cl.Deploy(ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +65,7 @@ func TestStatusAndDeployOverUnixSocket(t *testing.T) {
 	}
 	first := res.Status.Pid
 
-	res, err = cl.Deploy(ctx)
+	res, err = cl.Deploy(ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,16 +91,74 @@ func TestDeployFailureReported(t *testing.T) {
 		HealthInterval: 50 * time.Millisecond,
 		Logger:         log.New(io.Discard, "", 0),
 	}, fwd)
+	reg := registry.New(log.New(io.Discard, "", 0))
+	reg.Add("default", mgr, fwd)
 	sock := filepath.Join(t.TempDir(), "ctl.sock")
-	go NewServer(mgr, sock).ListenAndServe(ctx)
+	go NewServer(reg, sock).ListenAndServe(ctx)
 	for i := 0; i < 50; i++ {
 		if _, err := os.Stat(sock); err == nil {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	res, err := NewClient(sock).Deploy(ctx)
+	res, err := NewClient(sock).Deploy(ctx, "")
 	if err == nil || res.OK {
 		t.Fatalf("expected failure, got %+v err=%v", res, err)
+	}
+}
+
+func TestMultiServiceStatusAndDeploy(t *testing.T) {
+	py := []string{"python3", "-c", "import socket,time,os;s=socket.socket();s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(60)"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reg := registry.New(log.New(io.Discard, "", 0))
+
+	for _, name := range []string{"a", "b"} {
+		fwd, err := forwarder.New("127.0.0.1:0", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go fwd.Serve(ctx)
+		mgr := manager.New(manager.Config{
+			Command:        py,
+			HealthTimeout:  5 * time.Second,
+			HealthInterval: 50 * time.Millisecond,
+			Grace:          time.Second,
+			Logger:         log.New(io.Discard, "", 0),
+		}, fwd)
+		if err := reg.Add(name, mgr, fwd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer reg.Shutdown(context.Background())
+
+	sock := filepath.Join(t.TempDir(), "ctl.sock")
+	go NewServer(reg, sock).ListenAndServe(ctx)
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(sock); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cl := NewClient(sock)
+
+	if _, err := cl.Status(ctx, ""); err == nil {
+		t.Fatal("expected error when multiple services and no name")
+	}
+	all, err := cl.StatusAll(ctx)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("status all: %v err=%v", all, err)
+	}
+
+	res, err := cl.Deploy(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status.Name != "a" || res.Status.Deploys != 1 {
+		t.Fatalf("deploy a: %+v", res)
+	}
+	res, err = cl.Deploy(ctx, "b")
+	if err != nil || res.Status.Name != "b" {
+		t.Fatalf("deploy b: %+v err=%v", res, err)
 	}
 }

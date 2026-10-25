@@ -1,0 +1,23 @@
+# Go 시연 앱 + Java API 를 한 portswap 프로세스에서 기동하는 예시.
+# 저장소 루트에서: go build -o portswap . && ./examples/javademo/build.sh
+control: /tmp/portswap.sock
+
+services:
+  web:
+    listen: 127.0.0.1:9000
+    health: "http://127.0.0.1:{port}/health"
+    drain: 30s
+    grace: 15s
+    command:
+      - ./examples/demoapp/demoapp
+      - "-version=v1"
+
+  api:
+    listen: 127.0.0.1:9001
+    health: "http://127.0.0.1:{port}/health"
+    drain: 30s
+    grace: 15s
+    command:
+      - sh
+      - -c
+      - 'exec java -Dapp.version=${APP_VERSION:-v1} -cp examples/javademo/classes HttpDemo'
