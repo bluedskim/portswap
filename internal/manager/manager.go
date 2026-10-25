@@ -29,6 +29,7 @@ type Config struct {
 
 // Status 는 현재 상태 스냅샷이다.
 type Status struct {
+	Name        string    `json:"name,omitempty"`
 	Listen      string    `json:"listen"`
 	Backend     string    `json:"backend"`
 	Pid         int       `json:"pid"`

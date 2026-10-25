@@ -1,0 +1,11 @@
+control: /tmp/portswap.sock
+
+services:
+  demo:
+    listen: 127.0.0.1:9000
+    health: "http://127.0.0.1:{port}/health"
+    drain: 30s
+    grace: 15s
+    command:
+      - ./examples/demoapp/demoapp
+      - "-version=v1"

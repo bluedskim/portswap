@@ -91,7 +91,7 @@ func TestStopKillsAfterGrace(t *testing.T) {
 func TestWaitHealthyTCP(t *testing.T) {
 	port, _ := FreePort()
 	// 0.3초 뒤에 리슨을 시작하는 프로세스
-	p, err := Start([]string{"sh", "-c", "sleep 0.3; exec nc -l 127.0.0.1 {port} >/dev/null 2>&1 || exec python3 -c 'import socket,time;s=socket.socket();s.bind((\"127.0.0.1\",'$PORT'));s.listen();time.sleep(30)'"}, port, io.Discard, io.Discard)
+	p, err := Start([]string{"sh", "-c", "sleep 0.3; exec python3 -c 'import socket,os,time;s=socket.socket();s.bind((\"127.0.0.1\",int(os.environ[\"PORT\"])));s.listen();time.sleep(30)'"}, port, io.Discard, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
