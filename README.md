@@ -23,7 +23,7 @@ go build -o examples/demoapp/demoapp ./examples/demoapp   # 시연용 Go 앱
 
 # 사용법
 
-## 단일 서비스 (CLI, 기존과 동일)
+## 단일 서비스 (CLI)
 
 ```sh
 # 기동. '--' 뒤가 앱 명령이다.
@@ -43,7 +43,7 @@ portswap status --control /tmp/portswap.sock
 
 서비스가 하나뿐이면 `--service` 를 생략해도 된다.
 
-## 여러 서비스 (설정 파일)
+## 여러 서비스 (YAML)
 
 ```sh
 portswap serve --config portswap.yaml
@@ -53,7 +53,7 @@ portswap status --control /tmp/portswap.sock --service web
 portswap status --control /tmp/portswap.sock --all   # 전체 JSON
 ```
 
-`SIGHUP` 을내면 등록된 모든 서비스에 배포가 동시에 걸린다(서비스마다 배포는 여전히 한 번에 하나).
+`SIGHUP` 을 내면 등록된 모든 서비스에 배포가 걸린다. 각 서비스는 동시에 하나의 배포만 허용한다.
 
 설정 예 (`portswap.yaml`):
 
@@ -163,4 +163,5 @@ curl 127.0.0.1:9001/
 
 ```sh
 go test -race ./...
+./scripts/smoke.sh
 ```
