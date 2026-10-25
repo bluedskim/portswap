@@ -55,7 +55,7 @@ func (r *Registry) Add(name string, mgr *manager.Manager, fwd *forwarder.Forward
 // Names 은 등록된 서비스 이름 목록을 돌려준다.
 func (r *Registry) Names() []string {
 	r.mu.RLock()
-	defer r.mu.Unlock()
+	defer r.mu.RUnlock()
 	out := make([]string, len(r.order))
 	copy(out, r.order)
 	return out
