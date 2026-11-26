@@ -165,14 +165,33 @@ func (r *Registry) StartForwarders(ctx context.Context) {
 	}
 }
 
-// InitialDeploy 는 모든 서비스를 처음 띄운다. 하나라도 실패하면 오류다.
+// InitialDeploy 는 모든 서비스를 처음 띄운다. 하나라도 실패하면 이미 기동한 서비스를 롤백하고 오류를 돌려준다.
 func (r *Registry) InitialDeploy(ctx context.Context) error {
-	for _, name := range r.Names() {
+	names := r.Names()
+	deployed := make([]string, 0, len(names))
+	for _, name := range names {
 		if _, err := r.Deploy(ctx, name); err != nil {
+			r.rollbackInitial(deployed)
 			return fmt.Errorf("서비스 %s 초기 기동 실패: %w", name, err)
 		}
+		deployed = append(deployed, name)
 	}
 	return nil
+}
+
+func (r *Registry) rollbackInitial(deployed []string) {
+	if len(deployed) == 0 {
+		return
+	}
+	rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, name := range deployed {
+		e, err := r.EntryFor(name)
+		if err != nil {
+			continue
+		}
+		e.Mgr.Shutdown(rctx)
+	}
 }
 
 // Shutdown 은 모든 서비스를 종료한다.

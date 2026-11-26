@@ -1,0 +1,18 @@
+# smoke: 첫 서비스는 기동되고 두 번째가 실패할 때 serve 가 종료되고 첫 서비스 자식도 없어야 함.
+control: /tmp/portswap-fail-init.sock
+
+services:
+  # InitialDeploy 는 서비스 이름 정렬 순으로 기동한다 (aaa → zzz).
+  aaa-ok:
+    listen: 127.0.0.1:9200
+    health: "http://127.0.0.1:{port}/health"
+    health_timeout: 5s
+    grace: 2s
+    command:
+      - ./examples/demoapp/demoapp
+      - "-version=smoke-ok-marker"
+
+  zzz-bad:
+    listen: 127.0.0.1:9201
+    command:
+      - "false"

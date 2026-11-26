@@ -16,10 +16,20 @@
 # 빌드
 
 ```sh
-go build -o portswap .
+go build -ldflags "-X main.version=v0.2.0" -o portswap .
 go build -o examples/demoapp/demoapp ./examples/demoapp   # 시연용 Go 앱
 ./examples/javademo/build.sh                               # 시연용 Java 앱 (JDK 필요)
 ```
+
+버전 확인:
+
+```sh
+./portswap --version   # portswap v0.2.0
+./portswap -v
+./portswap version
+```
+
+`go build` 에 `-ldflags` 를 넣지 않으면 `portswap dev` 가 출력된다.
 
 # 사용법
 
@@ -53,7 +63,7 @@ portswap status --control /tmp/portswap.sock --service web
 portswap status --control /tmp/portswap.sock --all   # 전체 JSON
 ```
 
-`SIGHUP` 을 내면 등록된 모든 서비스에 배포가 걸린다. 각 서비스는 동시에 하나의 배포만 허용한다.
+`SIGHUP` 을 내면 등록된 모든 서비스에 배포가 걸린다. 각 서비스는 동시에 하나의 배포만 허용한다. 설정 파일의 `services` 는 이름 사전순으로 기동된다.
 
 설정 예 (`portswap.yaml`):
 

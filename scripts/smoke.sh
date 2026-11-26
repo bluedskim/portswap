@@ -17,7 +17,8 @@ cleanup() {
     kill -TERM "$PID_SINGLE" 2>/dev/null || true
     wait "$PID_SINGLE" 2>/dev/null || true
   fi
-  rm -f "$CONTROL" "$CONTROL_SINGLE"
+  rm -f "$CONTROL" "$CONTROL_SINGLE" /tmp/portswap-smoke-fail-health
+  fuser -k 9202/tcp 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -89,5 +90,76 @@ SOLO2=$(curl -sS http://127.0.0.1:9100/)
 echo "single solo1=$SOLO1 solo2=$SOLO2"
 case "$SOLO1" in *version=solo*) ;; *) exit 1;; esac
 case "$SOLO2" in *version=solo*) ;; *) exit 1;; esac
+
+# --- version (dev vs ldflags) ---
+go build -o portswap-dev .
+OUT=$(./portswap-dev --version); case "$OUT" in "portswap dev") ;; *) echo "bad --version: $OUT"; exit 1;; esac
+OUT=$(./portswap-dev -v); case "$OUT" in "portswap dev") ;; *) echo "bad -v: $OUT"; exit 1;; esac
+OUT=$(./portswap-dev version); case "$OUT" in "portswap dev") ;; *) echo "bad version: $OUT"; exit 1;; esac
+go build -ldflags '-X main.version=v0.2.0' -o portswap-release .
+OUT=$(./portswap-release --version); case "$OUT" in "portswap v0.2.0") ;; *) echo "bad release --version: $OUT"; exit 1;; esac
+mv ./portswap-release ./portswap
+
+# --- initial deploy failure: ok service must not leave orphans ---
+LOG_FAIL=/tmp/portswap-smoke-fail-init.log
+rm -f /tmp/portswap-fail-init.sock
+set +e
+./portswap serve --config examples/portswap-fail-init.yaml >"$LOG_FAIL" 2>&1
+FAIL_RC=$?
+set -e
+if [ "$FAIL_RC" -eq 0 ]; then
+  echo "expected non-zero exit on initial deploy failure"
+  cat "$LOG_FAIL"
+  exit 1
+fi
+if pgrep -f 'smoke-ok-marker' >/dev/null 2>&1; then
+  echo "orphan demoapp still running after failed initial deploy"
+  pgrep -af smoke-ok-marker
+  exit 1
+fi
+if curl -sf --max-time 0.5 http://127.0.0.1:9200/health >/dev/null 2>&1; then
+  echo "port 9200 still serves after failed initial deploy"
+  exit 1
+fi
+
+# --- deploy health failure keeps old process and error includes stderr tail ---
+CONTROL_FAIL=/tmp/portswap-smoke-deploy-fail.sock
+LOG_DEPLOY_FAIL=/tmp/portswap-smoke-deploy-fail.log
+FAIL_HEALTH_FLAG=/tmp/portswap-smoke-fail-health
+rm -f "$CONTROL_FAIL" "$FAIL_HEALTH_FLAG"
+./portswap serve --listen 127.0.0.1:9202 \
+  --health 'http://127.0.0.1:{port}/health' \
+  --health-timeout 10s \
+  --control "$CONTROL_FAIL" \
+  -- sh -c 'if [ -f /tmp/portswap-smoke-fail-health ]; then extra=-fail-health; rm -f /tmp/portswap-smoke-fail-health; fi; exec ./examples/demoapp/demoapp -version deployfail-ok $extra' \
+  >"$LOG_DEPLOY_FAIL" 2>&1 &
+PID_DF=$!
+for i in $(seq 1 40); do
+  curl -sf --max-time 1 http://127.0.0.1:9202/health >/dev/null 2>&1 && break
+  sleep 0.25
+done
+BODY_DF1=$(curl -sS http://127.0.0.1:9202/)
+set +e
+touch "$FAIL_HEALTH_FLAG"
+DEPLOY_ERR=$(./portswap deploy --control "$CONTROL_FAIL" 2>&1)
+DEPLOY_RC=$?
+set -e
+if [ "$DEPLOY_RC" -eq 0 ]; then
+  echo "deploy should fail on -fail-health"
+  exit 1
+fi
+case "$DEPLOY_ERR" in *demoapp*) ;; *) echo "deploy error missing stderr tail: $DEPLOY_ERR"; exit 1;; esac
+BODY_DF2=$(curl -sS http://127.0.0.1:9202/)
+case "$BODY_DF1" in *deployfail-ok*) ;; *) exit 1;; esac
+case "$BODY_DF2" in *deployfail-ok*) ;; *) exit 1;; esac
+PID1=$(echo "$BODY_DF1" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+PID2=$(echo "$BODY_DF2" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+if [ "$PID1" != "$PID2" ]; then
+  echo "pid should stay same after failed deploy ($PID1 vs $PID2)"
+  exit 1
+fi
+kill -TERM "$PID_DF" 2>/dev/null || true
+wait "$PID_DF" 2>/dev/null || true
+rm -f "$CONTROL_FAIL"
 
 echo "smoke OK"

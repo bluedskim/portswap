@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -26,6 +27,8 @@ import (
 
 const defaultSocket = "/tmp/portswap.sock"
 
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -33,6 +36,9 @@ func main() {
 	}
 	var err error
 	switch os.Args[1] {
+	case "version", "-v", "--version":
+		fmt.Printf("portswap %s\n", version)
+		return
 	case "serve":
 		err = runServe(os.Args[2:])
 	case "deploy":
@@ -62,6 +68,8 @@ func usage() {
   portswap deploy [--control /tmp/portswap.sock] [--service 이름]
       새 프로세스를 띄워 헬스체크 뒤 포워딩을 전환하고 옛 프로세스를 종료합니다.
   portswap status [--control /tmp/portswap.sock] [--service 이름] [--all]
+  portswap version | portswap -v | portswap --version
+      버전 문자열을 출력합니다 (빌드 시 -ldflags 로 설정).
 `)
 }
 
@@ -117,6 +125,9 @@ func runServe(args []string) error {
 
 	if err := reg.InitialDeploy(ctx); err != nil {
 		cancel()
+		sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
+		reg.Shutdown(sctx)
+		scancel()
 		return err
 	}
 
@@ -143,7 +154,13 @@ func loadConfigIntoRegistry(path string, reg *registry.Registry, logger *log.Log
 	if err != nil {
 		return err
 	}
-	for name, spec := range cfg.Services {
+	names := make([]string, 0, len(cfg.Services))
+	for name := range cfg.Services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		spec := cfg.Services[name]
 		spec.ApplyDefaults()
 		mgrCfg := registry.BuildManagerConfig(
 			spec.Command,

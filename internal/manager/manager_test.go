@@ -105,6 +105,21 @@ func TestDeploySwitchesAndKillsOld(t *testing.T) {
 	}
 }
 
+func TestFailedHealthIncludesAppOutputTail(t *testing.T) {
+	m, _ := newManager(t, Config{Command: []string{demoBin, "-version", "v1"}})
+	if _, err := m.Deploy(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m.cfg.Command = []string{demoBin, "-version", "tailtest", "-fail-health"}
+	_, err := m.Deploy(context.Background())
+	if err == nil {
+		t.Fatal("expected health failure")
+	}
+	if !strings.Contains(err.Error(), "demoapp") {
+		t.Fatalf("error should include app stderr tail: %q", err)
+	}
+}
+
 func TestFailedHealthKeepsOldProcess(t *testing.T) {
 	m, fwd := newManager(t, Config{Command: []string{demoBin, "-version", "v1"}, HealthTimeout: 700 * time.Millisecond})
 	p1, err := m.Deploy(context.Background())

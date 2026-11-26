@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -118,12 +119,15 @@ func (m *Manager) Deploy(ctx context.Context) (*proc.Process, error) {
 		return nil, fmt.Errorf("빈 포트 확보 실패: %w", err)
 	}
 	m.cfg.Logger.Printf("새 프로세스 기동: 포트 %d", port)
-	np, err := proc.Start(m.cfg.Command, port, m.cfg.Stdout, m.cfg.Stderr)
+	stdoutTw := proc.NewTailWriter(m.cfg.Stdout, 20, 4096)
+	stderrTw := proc.NewTailWriter(m.cfg.Stderr, 20, 4096)
+	np, err := proc.Start(m.cfg.Command, port, stdoutTw, stderrTw)
 	if err != nil {
 		return nil, fmt.Errorf("프로세스 기동 실패: %w", err)
 	}
 	m.cfg.Logger.Printf("pid %d 헬스체크 대기 (최대 %s)", np.Pid(), m.cfg.HealthTimeout)
 	if err := proc.WaitHealthy(ctx, np, m.cfg.Health, m.cfg.HealthTimeout, m.cfg.HealthInterval); err != nil {
+		err = enrichHealthError(err, stderrTw, stdoutTw)
 		m.cfg.Logger.Printf("pid %d 헬스체크 실패, 새 프로세스 종료: %v", np.Pid(), err)
 		np.Stop(context.Background(), m.cfg.Grace)
 		return nil, fmt.Errorf("헬스체크 실패: %w", err)
@@ -215,4 +219,21 @@ func (m *Manager) setDeploying(v bool) {
 	m.mu.Lock()
 	m.deploying = v
 	m.mu.Unlock()
+}
+
+func enrichHealthError(err error, stderr, stdout *proc.TailWriter) error {
+	if err == nil {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString(err.Error())
+	if tail := strings.TrimSpace(stderr.Tail()); tail != "" {
+		b.WriteString("\n앱 stderr (마지막):\n")
+		b.WriteString(tail)
+	}
+	if tail := strings.TrimSpace(stdout.Tail()); tail != "" {
+		b.WriteString("\n앱 stdout (마지막):\n")
+		b.WriteString(tail)
+	}
+	return errors.New(b.String())
 }
