@@ -112,8 +112,12 @@ func TestFailedHealthKeepsOldProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.cfg.Command = []string{demoBin, "-version", "v2", "-fail-health"}
-	if _, err := m.Deploy(context.Background()); err == nil {
+	_, deployErr := m.Deploy(context.Background())
+	if deployErr == nil {
 		t.Fatal("expected health failure")
+	}
+	if !strings.Contains(deployErr.Error(), "stderr") || !strings.Contains(deployErr.Error(), "listening") {
+		t.Fatalf("deploy error should include stderr tail: %v", deployErr)
 	}
 	if p1.Exited() {
 		t.Fatal("old process must survive a failed deploy")

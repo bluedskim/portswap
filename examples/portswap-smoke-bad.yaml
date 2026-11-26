@@ -1,0 +1,21 @@
+# smoke.sh: 두 번째 서비스가 실패하는 multi-service 설정 (good 먼저 기동 후 bad 실패).
+control: /tmp/portswap-smoke-bad.sock
+
+services:
+  good:
+    listen: 127.0.0.1:9200
+    health: "http://127.0.0.1:{port}/health"
+    health_timeout: 5s
+    grace: 5s
+    command:
+      - ./examples/demoapp/demoapp
+      - "-version=smoke-good-marker"
+
+  bad:
+    listen: 127.0.0.1:9201
+    health_timeout: 2s
+    grace: 2s
+    command:
+      - sh
+      - -c
+      - "echo smoke-bad-startup-failed >&2; exit 1"
