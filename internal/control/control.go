@@ -104,12 +104,14 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		res.Error = err.Error()
 		code = http.StatusConflict
-		if !errors.Is(err, manager.ErrDeployInProgress) {
+		if !errors.Is(err, manager.ErrDeployWaitInterrupted) && !errors.Is(err, manager.ErrManagerClosed) {
 			if stErr != nil {
 				code = http.StatusNotFound
 			} else {
 				code = http.StatusBadGateway
 			}
+		} else if errors.Is(err, manager.ErrDeployWaitInterrupted) {
+			code = http.StatusRequestTimeout
 		}
 	}
 	writeJSON(w, code, res)

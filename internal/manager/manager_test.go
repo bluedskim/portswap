@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -167,17 +168,141 @@ func TestInFlightRequestCompletesOnOldProcessDuringDeploy(t *testing.T) {
 	}
 }
 
-func TestConcurrentDeployRejected(t *testing.T) {
-	m, _ := newManager(t, Config{Command: []string{demoBin, "-startup-delay", "1s"}, HealthTimeout: 5 * time.Second})
-	errc := make(chan error, 1)
+func TestConcurrentDeployCoalesces(t *testing.T) {
+	m, fwd := newManager(t, Config{Command: []string{demoBin, "-startup-delay", "800ms"}, HealthTimeout: 5 * time.Second})
+	baseDeploys, err := m.Deploy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = baseDeploys
+	startDeploys := m.Status().Deploys
+
+	errc := make(chan error, 4)
 	go func() { _, err := m.Deploy(context.Background()); errc <- err }()
+	time.Sleep(100 * time.Millisecond)
+	for i := 0; i < 3; i++ {
+		go func() { _, err := m.Deploy(context.Background()); errc <- err }()
+	}
+	for i := 0; i < 4; i++ {
+		if err := <-errc; err != nil {
+			t.Fatalf("deploy waiter %d: %v", i, err)
+		}
+	}
+	st := m.Status()
+	if st.Deploys != startDeploys+2 {
+		t.Fatalf("deploys want %d got %d", startDeploys+2, st.Deploys)
+	}
+	if _, err := http.Get("http://" + fwd.Addr().String() + "/"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWatchRestartsAfterConcurrentFailedDeploy(t *testing.T) {
+	// 진행 중인 배포가 헬스체크에 실패할 때 현재 프로세스가 죽어도, watch 가 배포 종료를 기다린 뒤 재기동해야 한다.
+	marker := filepath.Join(t.TempDir(), "watch-race-fail.marker")
+	failAware := fmt.Sprintf(
+		`if [ -f %q ]; then exec %s -version v2 -fail-health; else exec %s -version v2; fi`,
+		marker, demoBin, demoBin,
+	)
+	m, fwd := newManager(t, Config{
+		Command:       []string{demoBin, "-version", "v1"},
+		AutoRestart:   true,
+		HealthTimeout: 3 * time.Second,
+	})
+	p1, err := m.Deploy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "http://" + fwd.Addr().String()
+
+	m.cfg.Command = []string{"sh", "-c", failAware}
+	if err := os.WriteFile(marker, []byte("1"), 0); err != nil {
+		t.Fatal(err)
+	}
+	deployDone := make(chan error, 1)
+	go func() {
+		_, err := m.Deploy(context.Background())
+		deployDone <- err
+	}()
 	time.Sleep(200 * time.Millisecond)
-	if _, err := m.Deploy(context.Background()); err != ErrDeployInProgress {
-		t.Fatalf("expected ErrDeployInProgress, got %v", err)
+	p1.Cmd.Process.Kill()
+
+	if deployErr := <-deployDone; deployErr == nil {
+		t.Fatal("expected health-check deploy to fail")
+	}
+	_ = os.Remove(marker)
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		st := m.Status()
+		if st.Backend != "" && st.Pid != 0 && st.Pid != p1.Pid() {
+			cur := m.Current()
+			if cur != nil && !cur.Exited() {
+				got := get(t, base+"/")
+				if strings.Contains(got, "version=v2") && strings.Contains(got, fmt.Sprintf("pid=%d", cur.Pid())) {
+					return
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("service did not recover; backend=%q status=%+v", fwd.Backend(), m.Status())
+}
+
+func TestDeployWaitTimeoutStillRunsFollowUp(t *testing.T) {
+	m, _ := newManager(t, Config{Command: []string{demoBin, "-startup-delay", "2s"}, HealthTimeout: 5 * time.Second})
+	if _, err := m.Deploy(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before := m.Status().Deploys
+	errc := make(chan error, 1)
+	go func() {
+		_, err := m.Deploy(context.Background())
+		errc <- err
+	}()
+	time.Sleep(150 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err := m.Deploy(ctx)
+	if !errors.Is(err, ErrDeployWaitInterrupted) {
+		t.Fatalf("expected ErrDeployWaitInterrupted, got %v", err)
 	}
 	if err := <-errc; err != nil {
 		t.Fatal(err)
 	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.Status().Deploys >= before+2 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("follow-up deploy did not run; deploys=%d want>=%d", m.Status().Deploys, before+2)
+}
+
+func TestShutdownCancelsPendingDeployWaiters(t *testing.T) {
+	m, fwd := newManager(t, Config{Command: []string{demoBin, "-startup-delay", "3s"}, HealthTimeout: 5 * time.Second})
+	if _, err := m.Deploy(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _, _ = m.Deploy(context.Background()) }()
+	time.Sleep(100 * time.Millisecond)
+	waitDone := make(chan error, 1)
+	go func() {
+		_, err := m.Deploy(context.Background())
+		waitDone <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	m.Shutdown(context.Background())
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, ErrManagerClosed) && !errors.Is(err, ErrDeployWaitInterrupted) {
+			t.Fatalf("waiter: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiter did not return after shutdown")
+	}
+	_ = fwd
 }
 
 func TestAutoRestartWhenProcessDies(t *testing.T) {

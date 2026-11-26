@@ -158,6 +158,98 @@ kill -TERM "$PID_DEPLOY"
 wait "$PID_DEPLOY" 2>/dev/null || true
 rm -f "$FAIL_MARKER" "$CONTROL_DEPLOY"
 
+# --- 배포 헬스 실패 중 현재 앱이 죽어도 자동 재기동으로 복구 ---
+pkill -f 'demoapp.*watch-race' 2>/dev/null || true
+RACE_MARKER=/tmp/portswap-smoke-watch-race.marker
+LOG_WATCH_RACE=/tmp/portswap-smoke-watch-race.log
+CONTROL_WATCH=/tmp/portswap-smoke-watch.sock
+rm -f "$RACE_MARKER" "$CONTROL_WATCH"
+./portswap serve --listen 127.0.0.1:9160 \
+  --health 'http://127.0.0.1:{port}/health' \
+  --control "$CONTROL_WATCH" \
+  -- sh -c 'extra=""; [ -f '"$RACE_MARKER"' ] && extra=-fail-health; exec ./examples/demoapp/demoapp -version watch-race $extra' \
+  >"$LOG_WATCH_RACE" 2>&1 &
+PID_WATCH=$!
+for i in $(seq 1 40); do
+  curl -sf --max-time 1 http://127.0.0.1:9160/health >/dev/null 2>&1 && break
+  sleep 0.25
+done
+RACE_BODY=$(curl -sS http://127.0.0.1:9160/)
+case "$RACE_BODY" in *version=watch-race*) ;; *) echo "unexpected watch-race body $RACE_BODY"; exit 1;; esac
+PID_LIVE=$(echo "$RACE_BODY" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+touch "$RACE_MARKER"
+./portswap deploy --control "$CONTROL_WATCH" >/dev/null 2>&1 &
+DEPLOY_BG=$!
+sleep 0.5
+if [ -n "$PID_LIVE" ] && kill -0 "$PID_LIVE" 2>/dev/null; then
+  kill -KILL "$PID_LIVE" 2>/dev/null || true
+fi
+rm -f "$RACE_MARKER"
+wait "$DEPLOY_BG" 2>/dev/null || true
+RECOVERED=0
+for i in $(seq 1 60); do
+  if curl -sf --max-time 1 http://127.0.0.1:9160/health >/dev/null 2>&1; then
+    BODY=$(curl -sS http://127.0.0.1:9160/)
+    case "$BODY" in *version=watch-race*) RECOVERED=1; break;; esac
+  fi
+  sleep 0.25
+done
+if [ "$RECOVERED" -ne 1 ]; then
+  echo "watch-race: service did not recover; log:"
+  cat "$LOG_WATCH_RACE"
+  exit 1
+fi
+if kill -0 "$PID_WATCH" 2>/dev/null; then
+  kill -TERM "$PID_WATCH"
+  wait "$PID_WATCH" 2>/dev/null || true
+fi
+if pgrep -f 'demoapp.*watch-race' >/dev/null 2>&1; then
+  echo "orphan demoapp after watch-race"
+  pgrep -af 'demoapp.*watch-race' || true
+  exit 1
+fi
+rm -f "$RACE_MARKER" "$CONTROL_WATCH"
+
+# --- 동시 deploy 합치기: 세 번 연속 호출, deploys +2 ---
+LOG_COALESCE=/tmp/portswap-smoke-coalesce.log
+CONTROL_CO=/tmp/portswap-smoke-coalesce.sock
+rm -f "$CONTROL_CO"
+./portswap serve --listen 127.0.0.1:9170 \
+  --health 'http://127.0.0.1:{port}/health' \
+  --control "$CONTROL_CO" \
+  -- ./examples/demoapp/demoapp -version coalesce -startup-delay 1s >"$LOG_COALESCE" 2>&1 &
+PID_CO=$!
+for i in $(seq 1 40); do
+  curl -sf --max-time 1 http://127.0.0.1:9170/health >/dev/null 2>&1 && break
+  sleep 0.25
+done
+DEPLOYS_BEFORE=$(./portswap status --control "$CONTROL_CO" 2>/dev/null | sed -n 's/.*"deploys"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+./portswap deploy --control "$CONTROL_CO" >/dev/null 2>&1 &
+C1=$!
+sleep 0.15
+./portswap deploy --control "$CONTROL_CO" >/dev/null 2>&1 &
+C2=$!
+./portswap deploy --control "$CONTROL_CO" >/dev/null 2>&1 &
+C3=$!
+wait "$C1" || { echo "coalesce deploy 1 failed"; exit 1; }
+wait "$C2" || { echo "coalesce deploy 2 failed"; exit 1; }
+wait "$C3" || { echo "coalesce deploy 3 failed"; exit 1; }
+curl -sf --max-time 2 http://127.0.0.1:9170/health >/dev/null || { echo "health after coalesce"; exit 1; }
+DEPLOYS_AFTER=$(./portswap status --control "$CONTROL_CO" 2>/dev/null | sed -n 's/.*"deploys"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+EXPECT=$((DEPLOYS_BEFORE + 2))
+if [ "$DEPLOYS_AFTER" -ne "$EXPECT" ]; then
+  echo "coalesce deploy count: before=$DEPLOYS_BEFORE after=$DEPLOYS_AFTER want=$EXPECT"
+  exit 1
+fi
+kill -TERM "$PID_CO"
+wait "$PID_CO" 2>/dev/null || true
+if pgrep -f 'demoapp.*coalesce' >/dev/null 2>&1; then
+  echo "orphan demoapp coalesce"
+  pgrep -af 'demoapp.*coalesce' || true
+  exit 1
+fi
+rm -f "$CONTROL_CO"
+
 # --- 버전 출력 ---
 PLAIN_VER=$(./portswap --version 2>/dev/null | tr -d '\n')
 case "$PLAIN_VER" in *"portswap dev") ;; *) echo "plain build version: $PLAIN_VER"; exit 1;; esac
