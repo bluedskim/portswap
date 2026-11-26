@@ -165,10 +165,13 @@ func (r *Registry) StartForwarders(ctx context.Context) {
 	}
 }
 
-// InitialDeploy 는 모든 서비스를 처음 띄운다. 하나라도 실패하면 오류다.
+// InitialDeploy 는 모든 서비스를 처음 띄운다. 하나라도 실패하면 이미 띄운 서비스를 모두 종료하고 오류다.
 func (r *Registry) InitialDeploy(ctx context.Context) error {
 	for _, name := range r.Names() {
 		if _, err := r.Deploy(ctx, name); err != nil {
+			sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			r.Shutdown(sctx)
+			cancel()
 			return fmt.Errorf("서비스 %s 초기 기동 실패: %w", name, err)
 		}
 	}

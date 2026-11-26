@@ -17,8 +17,16 @@
 
 ```sh
 go build -o portswap .
+# 릴리스 바이너리(버전 문자열 포함):
+go build -ldflags "-X main.version=v0.2.0" -o portswap .
 go build -o examples/demoapp/demoapp ./examples/demoapp   # 시연용 Go 앱
 ./examples/javademo/build.sh                               # 시연용 Java 앱 (JDK 필요)
+```
+
+버전 확인:
+
+```sh
+portswap version          # 또는 portswap --version, portswap -v
 ```
 
 # 사용법

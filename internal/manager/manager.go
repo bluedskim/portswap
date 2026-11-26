@@ -118,12 +118,14 @@ func (m *Manager) Deploy(ctx context.Context) (*proc.Process, error) {
 		return nil, fmt.Errorf("빈 포트 확보 실패: %w", err)
 	}
 	m.cfg.Logger.Printf("새 프로세스 기동: 포트 %d", port)
-	np, err := proc.Start(m.cfg.Command, port, m.cfg.Stdout, m.cfg.Stderr)
+	stderrTail, stderrW := proc.NewStderrTail(m.cfg.Stderr, 0, 0)
+	np, err := proc.Start(m.cfg.Command, port, m.cfg.Stdout, stderrW)
 	if err != nil {
 		return nil, fmt.Errorf("프로세스 기동 실패: %w", err)
 	}
 	m.cfg.Logger.Printf("pid %d 헬스체크 대기 (최대 %s)", np.Pid(), m.cfg.HealthTimeout)
 	if err := proc.WaitHealthy(ctx, np, m.cfg.Health, m.cfg.HealthTimeout, m.cfg.HealthInterval); err != nil {
+		err = proc.AppendHealthStderr(err, stderrTail)
 		m.cfg.Logger.Printf("pid %d 헬스체크 실패, 새 프로세스 종료: %v", np.Pid(), err)
 		np.Stop(context.Background(), m.cfg.Grace)
 		return nil, fmt.Errorf("헬스체크 실패: %w", err)

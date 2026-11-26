@@ -90,4 +90,81 @@ echo "single solo1=$SOLO1 solo2=$SOLO2"
 case "$SOLO1" in *version=solo*) ;; *) exit 1;; esac
 case "$SOLO2" in *version=solo*) ;; *) exit 1;; esac
 
+# --- 초기 기동 실패 시 이미 띄운 서비스 정리 ---
+LOG_INIT_FAIL=/tmp/portswap-smoke-initfail.log
+CONTROL_BAD=/tmp/portswap-smoke-bad.sock
+rm -f "$CONTROL_BAD"
+set +e
+./portswap serve --config examples/portswap-smoke-bad.yaml >"$LOG_INIT_FAIL" 2>&1
+INIT_RC=$?
+set -e
+if [ "$INIT_RC" -eq 0 ]; then
+  echo "expected non-zero exit for partial initial deploy"
+  exit 1
+fi
+if pgrep -f 'demoapp.*smoke-good-marker' >/dev/null 2>&1; then
+  echo "good service demoapp orphan still running after failed serve"
+  pgrep -af 'demoapp.*smoke-good-marker' || true
+  exit 1
+fi
+if curl -sf --max-time 1 http://127.0.0.1:9200/health >/dev/null 2>&1; then
+  echo "port 9200 still serves after failed initial deploy"
+  exit 1
+fi
+
+# --- 배포 헬스 실패 시 옛 PID 유지 + stderr 꼬리 ---
+FAIL_MARKER=/tmp/portswap-smoke-fail-health
+LOG_DEPLOY_FAIL=/tmp/portswap-smoke-deployfail.log
+CONTROL_DEPLOY=/tmp/portswap-smoke-deploy.sock
+rm -f "$FAIL_MARKER" "$CONTROL_DEPLOY"
+./portswap serve --listen 127.0.0.1:9150 \
+  --health 'http://127.0.0.1:{port}/health' \
+  --control "$CONTROL_DEPLOY" \
+  -- sh -c 'extra=""; [ -f '"$FAIL_MARKER"' ] && extra=-fail-health; exec ./examples/demoapp/demoapp -version=deploy-smoke $extra' \
+  >"$LOG_DEPLOY_FAIL" 2>&1 &
+PID_DEPLOY=$!
+for i in $(seq 1 40); do
+  curl -sf --max-time 1 http://127.0.0.1:9150/health >/dev/null 2>&1 && break
+  sleep 0.25
+done
+DEPLOY_BODY1=$(curl -sS http://127.0.0.1:9150/)
+case "$DEPLOY_BODY1" in *version=deploy-smoke*) ;; *) echo "unexpected body $DEPLOY_BODY1"; exit 1;; esac
+PID_KEEP=$(echo "$DEPLOY_BODY1" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+touch "$FAIL_MARKER"
+set +e
+./portswap deploy --control "$CONTROL_DEPLOY" 2>/tmp/portswap-smoke-deploy-err.txt
+DEPLOY_FAIL_RC=$?
+set -e
+if [ "$DEPLOY_FAIL_RC" -eq 0 ]; then
+  echo "expected deploy to fail when health fails"
+  kill -TERM "$PID_DEPLOY" 2>/dev/null || true
+  exit 1
+fi
+if ! grep -q 'stderr' /tmp/portswap-smoke-deploy-err.txt && \
+   ! grep -q 'listening' /tmp/portswap-smoke-deploy-err.txt; then
+  echo "deploy error missing stderr tail:"
+  cat /tmp/portswap-smoke-deploy-err.txt
+  kill -TERM "$PID_DEPLOY" 2>/dev/null || true
+  exit 1
+fi
+DEPLOY_BODY2=$(curl -sS http://127.0.0.1:9150/)
+PID_AFTER=$(echo "$DEPLOY_BODY2" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+if [ "$PID_KEEP" != "$PID_AFTER" ]; then
+  echo "pid changed after failed deploy ($PID_KEEP -> $PID_AFTER)"
+  kill -TERM "$PID_DEPLOY" 2>/dev/null || true
+  exit 1
+fi
+kill -TERM "$PID_DEPLOY"
+wait "$PID_DEPLOY" 2>/dev/null || true
+rm -f "$FAIL_MARKER" "$CONTROL_DEPLOY"
+
+# --- 버전 출력 ---
+PLAIN_VER=$(./portswap --version 2>/dev/null | tr -d '\n')
+case "$PLAIN_VER" in *"portswap dev") ;; *) echo "plain build version: $PLAIN_VER"; exit 1;; esac
+go build -ldflags "-X main.version=v0.2.0-smoke" -o portswap-versioned .
+for flag in --version -v version; do
+  VOUT=$(./portswap-versioned $flag 2>/dev/null | tr -d '\n')
+  case "$VOUT" in *"portswap v0.2.0-smoke") ;; *) echo "flag $flag: $VOUT"; exit 1;; esac
+done
+
 echo "smoke OK"

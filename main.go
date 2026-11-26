@@ -26,7 +26,16 @@ import (
 
 const defaultSocket = "/tmp/portswap.sock"
 
+var version = "dev"
+
 func main() {
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "version", "--version", "-v":
+			printVersion()
+			return
+		}
+	}
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -51,8 +60,14 @@ func main() {
 	}
 }
 
+func printVersion() {
+	fmt.Printf("portswap %s\n", version)
+}
+
 func usage() {
 	fmt.Fprint(os.Stderr, `사용법:
+  portswap version | portswap --version | portswap -v
+      빌드에 박힌 버전을 출력합니다.
   portswap serve  --listen :8080 [--health URL] [--health-timeout 30s] [--drain 30s] [--grace 15s]
                   [--control /tmp/portswap.sock] [--no-restart] -- <앱 명령> [인자...]
       앱 명령의 {port} 는 빈 포트로 치환되고 환경변수 PORT 로도 전달됩니다.
@@ -117,6 +132,9 @@ func runServe(args []string) error {
 
 	if err := reg.InitialDeploy(ctx); err != nil {
 		cancel()
+		sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
+		reg.Shutdown(sctx)
+		scancel()
 		return err
 	}
 
