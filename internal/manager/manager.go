@@ -40,22 +40,42 @@ type Status struct {
 	Deploying   bool      `json:"deploying"`
 }
 
+// deployOutcome 은 배포 한 번의 결과다.
+type deployOutcome struct {
+	p   *proc.Process
+	err error
+}
+
+// deployWaiter 는 진행 중인 배포가 끝난 뒤 이어질 합쳐진 배포 결과를 기다린다.
+type deployWaiter struct {
+	ch  chan deployOutcome
+	ctx context.Context
+}
+
 // Manager 는 현재 앱 프로세스와 포워더를 소유한다.
 type Manager struct {
 	cfg Config
 	fwd *forwarder.Forwarder
 
-	mu        sync.Mutex
-	deployMu  sync.Mutex // deploy 는 한 번에 하나만
-	current   *proc.Process
-	startedAt time.Time
-	deploys   int
-	deploying bool
-	closed    bool
+	mu            sync.Mutex
+	deployMu      sync.Mutex
+	deployRunning bool
+	pendingFollow bool          // 진행 중 배포 종료 뒤 한 번 더 배포할지
+	pendingUser   bool          // 대기 중 호출에 사용자 요청이 포함됐는지
+	pendingWatch  *proc.Process // watch 만 대기할 때, 건너뛸지 판단용 죽은 프로세스
+	followWaiters []*deployWaiter
+	current       *proc.Process
+	startedAt     time.Time
+	deploys       int
+	deploying     bool
+	closed        bool
 }
 
-// ErrDeployInProgress 는 다른 deploy 가 진행 중일 때 돌려준다.
-var ErrDeployInProgress = errors.New("다른 배포가 진행 중입니다")
+// ErrDeployWaitInterrupted 는 배포 대기가 ctx 취소·타임아웃으로 끊겼을 때 돌려준다. 합쳐진 배포는 계속 진행된다.
+var ErrDeployWaitInterrupted = errors.New("배포 대기가 중단되었습니다")
+
+// ErrManagerClosed 는 Manager 가 종료된 뒤 배포를 요청했을 때 돌려준다.
+var ErrManagerClosed = errors.New("관리자가 종료되었습니다")
 
 // New 는 Manager 를 만든다. 아직 프로세스는 띄우지 않는다.
 func New(cfg Config, fwd *forwarder.Forwarder) *Manager {
@@ -103,13 +123,129 @@ func (m *Manager) Status() Status {
 	return s
 }
 
-// Deploy 는 새 프로세스를 빈 포트에 띄우고 헬스체크를 통과하면 포워딩을 전환한 뒤 옛 프로세스를 종료한다.
-// 헬스체크에 실패하면 새 프로세스를 죽이고 옛 프로세스는 그대로 둔다.
+// Deploy 는 새 프로세스를 띄우고 헬스체크 후 전환한다. 다른 배포가 진행 중이면
+// 한 번의 후속 배포로 합쳐지며, 대기한 호출자는 그 후속 배포 결과를 받는다.
 func (m *Manager) Deploy(ctx context.Context) (*proc.Process, error) {
-	if !m.deployMu.TryLock() {
-		return nil, ErrDeployInProgress
+	return m.requestDeploy(ctx, true, nil)
+}
+
+// deployFromWatch 는 watch 가 죽은 프로세스를 대신해 재기동을 요청한다. 사용자 배포와 겹치면 사용자 배포가 우선한다.
+func (m *Manager) deployFromWatch(ctx context.Context, dead *proc.Process) (*proc.Process, error) {
+	return m.requestDeploy(ctx, false, dead)
+}
+
+func (m *Manager) requestDeploy(ctx context.Context, user bool, dead *proc.Process) (*proc.Process, error) {
+	m.deployMu.Lock()
+	if m.closed {
+		m.deployMu.Unlock()
+		return nil, ErrManagerClosed
 	}
-	defer m.deployMu.Unlock()
+	if !m.deployRunning {
+		m.deployRunning = true
+		m.deployMu.Unlock()
+		p, err := m.runDeploy(ctx)
+		m.finishDeployCycle()
+		return p, err
+	}
+	m.coalesceFollow(user, dead)
+	w := &deployWaiter{ch: make(chan deployOutcome, 1), ctx: ctx}
+	m.followWaiters = append(m.followWaiters, w)
+	m.deployMu.Unlock()
+
+	select {
+	case out := <-w.ch:
+		return out.p, out.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%w: %w", ErrDeployWaitInterrupted, ctx.Err())
+	}
+}
+
+func (m *Manager) coalesceFollow(user bool, dead *proc.Process) {
+	m.pendingFollow = true
+	if user {
+		m.pendingUser = true
+	} else if dead != nil {
+		m.pendingWatch = dead
+	}
+}
+
+// finishDeployCycle 은 진행 중이던 배포가 끝난 뒤, 합쳐진 후속 배포를 최대 한 번씩 반복 실행한다.
+func (m *Manager) finishDeployCycle() {
+	for {
+		m.deployMu.Lock()
+		waiters := m.followWaiters
+		m.followWaiters = nil
+		pending := m.pendingFollow
+		pendingUser := m.pendingUser
+		watchDead := m.pendingWatch
+		m.pendingFollow = false
+		m.pendingUser = false
+		m.pendingWatch = nil
+		closed := m.closed
+		m.deployMu.Unlock()
+
+		if !pending {
+			m.deployMu.Lock()
+			m.deployRunning = false
+			m.deployMu.Unlock()
+			return
+		}
+		if closed {
+			m.failWaiters(waiters, ErrManagerClosed)
+			m.deployMu.Lock()
+			m.deployRunning = false
+			m.deployMu.Unlock()
+			return
+		}
+
+		out := m.runFollowDeploy(pendingUser, watchDead)
+		m.deliverWaiters(waiters, out)
+
+		m.deployMu.Lock()
+		if !m.pendingFollow {
+			m.deployRunning = false
+			m.deployMu.Unlock()
+			return
+		}
+		m.deployMu.Unlock()
+	}
+}
+
+func (m *Manager) runFollowDeploy(pendingUser bool, watchDead *proc.Process) deployOutcome {
+	if !pendingUser && watchDead != nil {
+		m.mu.Lock()
+		cur := m.current
+		alive := cur != nil && cur != watchDead && !cur.Exited()
+		m.mu.Unlock()
+		if alive {
+			return deployOutcome{p: cur}
+		}
+	}
+	p, err := m.runDeploy(context.Background())
+	return deployOutcome{p: p, err: err}
+}
+
+func (m *Manager) deliverWaiters(waiters []*deployWaiter, out deployOutcome) {
+	for _, w := range waiters {
+		select {
+		case w.ch <- out:
+		default:
+		}
+	}
+}
+
+func (m *Manager) failWaiters(waiters []*deployWaiter, err error) {
+	out := deployOutcome{err: err}
+	for _, w := range waiters {
+		select {
+		case w.ch <- out:
+		default:
+		}
+	}
+}
+
+// runDeploy 는 실제 배포 한 번을 수행한다.
+func (m *Manager) runDeploy(ctx context.Context) (*proc.Process, error) {
 	m.setDeploying(true)
 	defer m.setDeploying(false)
 
@@ -131,7 +267,6 @@ func (m *Manager) Deploy(ctx context.Context) (*proc.Process, error) {
 		return nil, fmt.Errorf("헬스체크 실패: %w", err)
 	}
 
-	// 전환
 	m.mu.Lock()
 	old := m.current
 	m.current = np
@@ -186,13 +321,14 @@ func (m *Manager) watch(p *proc.Process) {
 		if closed {
 			return
 		}
-		if _, err := m.Deploy(context.Background()); err == nil {
-			return
-		} else if !errors.Is(err, ErrDeployInProgress) {
-			m.cfg.Logger.Printf("재기동 실패: %v (%s 후 재시도)", err, backoff)
-		} else {
+		_, err := m.deployFromWatch(context.Background(), p)
+		if err == nil {
 			return
 		}
+		if errors.Is(err, ErrManagerClosed) {
+			return
+		}
+		m.cfg.Logger.Printf("재기동 실패: %v (%s 후 재시도)", err, backoff)
 		time.Sleep(backoff)
 		if backoff < 30*time.Second {
 			backoff *= 2
@@ -202,8 +338,15 @@ func (m *Manager) watch(p *proc.Process) {
 
 // Shutdown 은 현재 프로세스를 종료한다. 이후 자동 재기동은 하지 않는다.
 func (m *Manager) Shutdown(ctx context.Context) {
-	m.mu.Lock()
+	m.deployMu.Lock()
 	m.closed = true
+	waiters := m.followWaiters
+	m.followWaiters = nil
+	m.pendingFollow = false
+	m.deployMu.Unlock()
+	m.failWaiters(waiters, ErrManagerClosed)
+
+	m.mu.Lock()
 	cur := m.current
 	m.current = nil
 	m.fwd.SetBackend("")

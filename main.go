@@ -74,8 +74,9 @@ func usage() {
       SIGHUP 을 받으면 deploy 와 같은 동작을 합니다(다중 서비스면 모두 배포).
   portswap serve  --config portswap.yaml
       YAML 설정으로 여러 서비스를 한 프로세스에서 기동합니다.
-  portswap deploy [--control /tmp/portswap.sock] [--service 이름]
+  portswap deploy [--control /tmp/portswap.sock] [--service 이름] [--timeout 5m]
       새 프로세스를 띄워 헬스체크 뒤 포워딩을 전환하고 옛 프로세스를 종료합니다.
+      다른 배포가 진행 중이면 끝난 뒤 한 번 더 배포하도록 합쳐지며, 대기 호출은 --timeout 안에 그 결과를 받습니다.
   portswap status [--control /tmp/portswap.sock] [--service 이름] [--all]
 `)
 }
@@ -195,7 +196,7 @@ func runDeploy(args []string) error {
 	fs := flag.NewFlagSet("deploy", flag.ExitOnError)
 	sock := fs.String("control", defaultSocket, "제어용 유닉스 소켓 경로")
 	service := fs.String("service", "", "배포할 서비스 이름 (유일한 서비스면 생략 가능)")
-	timeout := fs.Duration("timeout", 5*time.Minute, "배포 완료 대기 시간")
+	timeout := fs.Duration("timeout", 5*time.Minute, "배포·대기 포함 전체 제한 시간")
 	fs.Parse(args)
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
